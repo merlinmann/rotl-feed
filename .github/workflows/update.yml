@@ -1,0 +1,42 @@
+name: Update ROTL feed
+
+# Refreshes feed.xml from Squarespace's live feed, commits it, and GitHub Pages
+# (configured to deploy from the main branch) republishes automatically.
+# Runs in the cloud on a schedule -- no local hardware involved. Also runs on demand.
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # hourly, at :17
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rotl-feed-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Add any new episodes
+        run: python3 update.py
+
+      - name: Commit if changed
+        run: |
+          if ! git diff --quiet feed.xml .mp3-length-cache.json; then
+            git config user.name  "rotl-feed-bot"
+            git config user.email "actions@github.com"
+            git add feed.xml .mp3-length-cache.json
+            git commit -m "auto: refresh feed $(date -u +%FT%TZ)"
+            git push
+          else
+            echo "no change"
+          fi
