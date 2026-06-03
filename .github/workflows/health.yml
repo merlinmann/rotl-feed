@@ -1,0 +1,24 @@
+name: ROTL feed health
+
+# Verifies the LIVE feed (FeedBurner + Pages) is 200, valid XML, and complete.
+# A failed run makes GitHub email the repo owner -- the alert, no local machine needed.
+# Runs every 6 hours and on demand.
+
+on:
+  schedule:
+    - cron: "37 */6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check live feed health
+        run: python3 healthcheck.py
