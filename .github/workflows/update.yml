@@ -6,7 +6,7 @@ name: Update ROTL feed
 
 on:
   schedule:
-    - cron: "17 * * * *"   # hourly, at :17
+    - cron: "*/15 * * * *"   # every 15 minutes
   workflow_dispatch: {}
 
 permissions:
