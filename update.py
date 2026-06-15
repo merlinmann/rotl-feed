@@ -54,6 +54,28 @@ def guid_of(item):
     return (g.text or "").strip() if g is not None else None
 
 
+def refresh_build_date(channel):
+    """Set <lastBuildDate> to the newest episode's pubDate. It was frozen at the
+    one-shot build date (2026-02-02) because this incremental updater never touched
+    it -- cosmetic, but a stale lastBuildDate trips strict feed validators. Returns
+    True only when the value actually changed, so a no-op run produces no diff (and
+    so no hourly commit). 2026-06-15."""
+    items = channel.findall("item")
+    if not items:
+        return False
+    pub = max(items, key=ep_num).findtext("pubDate")
+    if not pub:
+        return False
+    lbd = channel.find("lastBuildDate")
+    if lbd is None:
+        lbd = ET.Element("lastBuildDate")
+        channel.insert(0, lbd)
+    if (lbd.text or "").strip() == pub.strip():
+        return False
+    lbd.text = pub
+    return True
+
+
 def repair_live(raw):
     end = raw.rfind("</item>")
     if end == -1:
@@ -122,10 +144,13 @@ def main():
 
     new = [it for it in live_items if guid_of(it) and guid_of(it) not in have]
     if not new:
-        if nf_added:
+        bd_changed = refresh_build_date(channel)
+        if nf_added or bd_changed:
             tree.write(FEED, encoding="UTF-8", xml_declaration=True)
             ET.parse(FEED)  # validate; raises on malformed
-            print("feed.xml updated (itunes:new-feed-url added); no new episodes")
+            reasons = [r for r, on in (("itunes:new-feed-url", nf_added),
+                                       ("lastBuildDate", bd_changed)) if on]
+            print(f"feed.xml updated ({', '.join(reasons)}); no new episodes")
             return 0
         print("no new episodes -- feed.xml unchanged")
         return 0
@@ -149,6 +174,7 @@ def main():
     for it in items:
         channel.append(it)
 
+    refresh_build_date(channel)
     tree.write(FEED, encoding="UTF-8", xml_declaration=True)
     ET.parse(FEED)  # validate; raises on malformed
     titles = ", ".join((it.findtext("title") or "?").strip() for it in new)
