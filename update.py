@@ -97,6 +97,21 @@ def main():
     have = {guid_of(it) for it in channel.findall("item")}
     print(f"feed.xml: {len(have)} existing items")
 
+    # Retire the FeedBurner hop: advertise the canonical GitHub Pages URL so Apple
+    # and compliant apps migrate subscribers off FeedBurner over the coming weeks.
+    # Idempotent + self-healing -- added once, then preserved on every later run.
+    ITUNES_NS = "http://www.itunes.com/dtds/podcast-1.0.dtd"
+    NEW_FEED_URL = "https://merlinmann.github.io/rotl-feed/feed.xml"
+    nf_added = False
+    if channel.find(f"{{{ITUNES_NS}}}new-feed-url") is None:
+        nf = ET.Element(f"{{{ITUNES_NS}}}new-feed-url")
+        nf.text = NEW_FEED_URL
+        first_item = channel.find("item")
+        idx = list(channel).index(first_item) if first_item is not None else len(list(channel))
+        channel.insert(idx, nf)
+        nf_added = True
+        print(f"added itunes:new-feed-url -> {NEW_FEED_URL}")
+
     with urllib.request.urlopen(
         urllib.request.Request(LIVE_URL, headers={"User-Agent": "rotl-feed-updater/1.0"}),
         timeout=30,
@@ -107,6 +122,11 @@ def main():
 
     new = [it for it in live_items if guid_of(it) and guid_of(it) not in have]
     if not new:
+        if nf_added:
+            tree.write(FEED, encoding="UTF-8", xml_declaration=True)
+            ET.parse(FEED)  # validate; raises on malformed
+            print("feed.xml updated (itunes:new-feed-url added); no new episodes")
+            return 0
         print("no new episodes -- feed.xml unchanged")
         return 0
 
