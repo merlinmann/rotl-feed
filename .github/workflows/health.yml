@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  actions: read   # healthcheck.py reads update.yml run history for the updater heartbeat
 
 jobs:
   health:
