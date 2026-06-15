@@ -35,6 +35,68 @@ for p, u in NS.items():
 
 EP_RE = re.compile(r"Ep\.?\s*0*(\d+)", re.I)
 MP3_RE = re.compile(r"rotl_0*(\d+)\.mp3", re.I)
+TAG_RE = re.compile(r"<[^>]+>")
+
+
+def fetch_notes(link_url):
+    """Pull show notes from an episode's HTML page when Squarespace's rss.xml ships
+    a blank <description> (its XML Syndication is set to titles-only). The notes live
+    in <div class="body"> ... <p class="enclosureWrapper">. Returns the inner HTML
+    (relative storage/roderick URLs absolutised) or None on ANY fetch/parse failure --
+    callers must treat None as 'leave the existing description untouched'."""
+    if not link_url:
+        return None
+    try:
+        req = urllib.request.Request(link_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            page_html = r.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    m = re.search(r'<div class="body">(.*?)<p class="enclosureWrapper">', page_html, re.S)
+    if not m:
+        m = re.search(r'<div class="body">(.*?)</div>', page_html, re.S)
+        if not m:
+            return None
+    body = m.group(1)
+    body = body.replace('src="/storage/', 'src="http://www.merlinmann.com/storage/')
+    body = body.replace('href="/roderick/', 'href="http://www.merlinmann.com/roderick/')
+    body = body.strip()
+    return body or None
+
+
+def description_is_blank(item):
+    """True when the item has no <description> or its text is empty after stripping
+    HTML tags and whitespace."""
+    d = item.find("description")
+    if d is None or not d.text:
+        return True
+    return TAG_RE.sub("", d.text).strip() == ""
+
+
+def backfill_blank_notes(channel, limit=30):
+    """For the newest `limit` items (by episode number) whose <description> is blank,
+    fetch the notes from the episode's HTML page and fill it in. Only ever fills an
+    empty description -- it never blanks or overwrites existing notes, so it fires once
+    per blank episode and then never again (no churn). A later edit to the HTML page
+    does NOT propagate; that is intended. Returns the list of episode numbers filled."""
+    items = sorted(channel.findall("item"), key=ep_num, reverse=True)[:limit]
+    filled = []
+    for it in items:
+        if not description_is_blank(it):
+            continue
+        notes = fetch_notes(it.findtext("link"))
+        if not notes:
+            continue
+        d = it.find("description")
+        if d is None:
+            d = ET.Element("description")
+            title = it.find("title")
+            idx = list(it).index(title) + 1 if title is not None else 0
+            it.insert(idx, d)
+        d.text = notes
+        n = ep_num(it)
+        filled.append(n if n >= 0 else "?")
+    return filled
 
 
 def ep_num(item):
@@ -145,12 +207,15 @@ def main():
     new = [it for it in live_items if guid_of(it) and guid_of(it) not in have]
     if not new:
         bd_changed = refresh_build_date(channel)
-        if nf_added or bd_changed:
+        filled = backfill_blank_notes(channel)
+        if nf_added or bd_changed or filled:
             tree.write(FEED, encoding="UTF-8", xml_declaration=True)
             ET.parse(FEED)  # validate; raises on malformed
             reasons = [r for r, on in (("itunes:new-feed-url", nf_added),
                                        ("lastBuildDate", bd_changed)) if on]
-            print(f"feed.xml updated ({', '.join(reasons)}); no new episodes")
+            if filled:
+                reasons.append("backfilled notes: " + ", ".join(f"e{n}" for n in filled))
+            print(f"feed.xml updated ({'; '.join(reasons)}); no new episodes")
             return 0
         print("no new episodes -- feed.xml unchanged")
         return 0
@@ -175,10 +240,13 @@ def main():
         channel.append(it)
 
     refresh_build_date(channel)
+    filled = backfill_blank_notes(channel)
     tree.write(FEED, encoding="UTF-8", xml_declaration=True)
     ET.parse(FEED)  # validate; raises on malformed
     titles = ", ".join((it.findtext("title") or "?").strip() for it in new)
     print(f"added {len(new)} episode(s): {titles}")
+    if filled:
+        print("backfilled notes: " + ", ".join(f"e{n}" for n in filled))
     print(f"feed.xml now {len(items)} items, validated OK")
     return 0
 
