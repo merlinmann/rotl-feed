@@ -141,7 +141,9 @@ def refresh_build_date(channel):
 def repair_live(raw):
     end = raw.rfind("</item>")
     if end == -1:
-        raise SystemExit("live feed has no complete <item> -- cannot repair")
+        # ValueError, not SystemExit: a truncated/empty upstream body is a transient
+        # Squarespace hiccup that main() catches and turns into a no-op green run.
+        raise ValueError("live feed has no complete <item> -- cannot repair")
     return raw[: end + len("</item>")] + "</channel></rss>"
 
 
@@ -196,13 +198,27 @@ def main():
         nf_added = True
         print(f"added itunes:new-feed-url -> {NEW_FEED_URL}")
 
-    with urllib.request.urlopen(
-        urllib.request.Request(LIVE_URL, headers={"User-Agent": "rotl-feed-updater/1.0"}),
-        timeout=30,
-    ) as r:
-        raw = r.read().decode("utf-8", "replace")
-    live = ET.fromstring(repair_live(raw))
-    live_items = live.find("channel").findall("item")
+    # feed.xml is the source of truth. Squarespace's live rss.xml is only consulted to
+    # discover NEW episodes, and it intermittently serves a 5xx, a timeout, or a
+    # truncated body. A momentary upstream hiccup must NOT fail the job (which emails
+    # Merlin) -- it's a no-op: skip the new-episode check, still run local maintenance
+    # (new-feed-url / lastBuildDate / note backfill), and exit 0. A genuine sustained
+    # outage is caught separately by the every-6-hours ROTL feed health workflow.
+    live_items = []
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(LIVE_URL, headers={"User-Agent": "rotl-feed-updater/1.0"}),
+            timeout=30,
+        ) as r:
+            raw = r.read().decode("utf-8", "replace")
+        live = ET.fromstring(repair_live(raw))
+        live_channel = live.find("channel")
+        if live_channel is None:
+            raise ValueError("live feed has no <channel>")
+        live_items = live_channel.findall("item")
+    except (urllib.error.URLError, OSError, ValueError, ET.ParseError) as e:
+        print(f"WARNING: live feed unavailable this run ({e}); "
+              "keeping feed.xml as-is and skipping new-episode check")
 
     new = [it for it in live_items if guid_of(it) and guid_of(it) not in have]
     if not new:
