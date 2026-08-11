@@ -2,11 +2,12 @@
 """Incrementally refresh feed.xml for Roderick on the Line.
 
 feed.xml is the complete, valid source of truth (631+ episodes, all GUIDs preserved).
-This script ONLY adds episodes that aren't in it yet: it fetches Squarespace's live
-rss.xml (whose newest items stay valid even when the old tail truncates), finds any
+This script adds episodes that aren't in it yet, and moves an enclosure to the public
+radio archive once an exact-size audio copy is available there. It fetches Squarespace's
+live rss.xml (whose newest items stay valid even when the old tail truncates), finds any
 <item> whose GUID isn't already present, fills a real enclosure length= via a ranged
 GET, inserts it at the top, validates, and rewrites feed.xml. Exits 0 with no change
-when nothing is new.
+when nothing is new and no enclosure is ready to migrate.
 
 Designed to run on GitHub Actions cron -- no Merlin hardware involved. See
 rotl/reference/feed-migration-2026-06-02.md in the hub for the full picture.
@@ -16,6 +17,7 @@ import re
 import sys
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -23,6 +25,7 @@ HERE = Path(__file__).resolve().parent
 FEED = HERE / "feed.xml"
 CACHE = HERE / ".mp3-length-cache.json"
 LIVE_URL = "http://www.merlinmann.com/roderick/rss.xml"
+RADIO_BASE = "https://radio.contiguous.me/rotl/episodes/"
 
 NS = {
     "content": "http://purl.org/rss/1.0/modules/content/",
@@ -35,7 +38,14 @@ for p, u in NS.items():
 
 EP_RE = re.compile(r"Ep\.?\s*0*(\d+)", re.I)
 MP3_RE = re.compile(r"rotl_0*(\d+)\.mp3", re.I)
+ARCHIVE_MP3_RE = re.compile(r"rotl_(?:e)?0*(\d+)\.mp3", re.I)
 TAG_RE = re.compile(r"<[^>]+>")
+LEGACY_ARCHIVE_ALIASES = {
+    "rotl_0580a.mp3": "rotl_0580.mp3",
+    "rotl_0047_esquivalience.mp3": "rotl_0047.mp3",
+    "b2w-031.mp3": "rotl_0046.mp3",
+    "rotl-0018.mp3": "rotl_0018.mp3",
+}
 
 
 def fetch_notes(link_url):
@@ -147,9 +157,30 @@ def repair_live(raw):
     return raw[: end + len("</item>")] + "</channel></rss>"
 
 
+def archive_filename(url):
+    """Return the canonical filename used by the public RotL media archive."""
+    path = urllib.parse.unquote(urllib.parse.urlsplit(url).path)
+    name = Path(path).name
+    if name.lower() in LEGACY_ARCHIVE_ALIASES:
+        return LEGACY_ARCHIVE_ALIASES[name.lower()]
+    match = ARCHIVE_MP3_RE.fullmatch(name)
+    if match:
+        return f"rotl_{int(match.group(1)):04d}.mp3"
+    if name in {"ballew-rotl-song.mp3", "rotl_bonus_verdi.mp3"}:
+        return name
+    return None
+
+
+def radio_url(url):
+    filename = archive_filename(url)
+    return RADIO_BASE + filename if filename else None
+
+
 def mp3_length(url, cache):
     """Ranged GET -> 206 + Content-Range: bytes 0-0/TOTAL. HEAD 403s because the MP3
-    URL redirects to a GET-signed S3 URL. Cache only successes so misses retry."""
+    URL redirects to a GET-signed S3 URL. Only accept audio responses: Squarespace's
+    V5 outage page returns 206 + Content-Length too, but it is HTML, not an MP3.
+    Cache only successes so misses retry."""
     if cache.get(url):
         return cache[url]
     val = None
@@ -157,12 +188,15 @@ def mp3_length(url, cache):
         req = urllib.request.Request(
             url, headers={"User-Agent": "rotl-feed-updater/1.0", "Range": "bytes=0-0"})
         with urllib.request.urlopen(req, timeout=25) as r:
+            content_type = (r.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+            if not content_type.startswith("audio/"):
+                return None
             cr = r.headers.get("Content-Range")
             if cr and "/" in cr:
                 total = cr.rsplit("/", 1)[-1]
                 if total.isdigit():
                     val = int(total)
-            if val is None:
+            if val is None and r.getcode() == 200:
                 cl = r.headers.get("Content-Length")
                 if cl and cl.isdigit():
                     val = int(cl)
@@ -173,6 +207,44 @@ def mp3_length(url, cache):
     return val
 
 
+def migrate_ready_enclosures(channel, cache):
+    """Move non-radio enclosures to the public archive once their exact file is ready.
+
+    The committed feed is already migrated, so routine runs only probe new/unmigrated
+    items. A candidate must serve audio and match the enclosure's declared byte length;
+    otherwise the existing URL stays untouched and the next run retries.
+    """
+    migrated = []
+    for item in channel.findall("item"):
+        enc = item.find("enclosure")
+        if enc is None:
+            continue
+        current = enc.get("url", "")
+        if current.startswith(RADIO_BASE):
+            continue
+        candidate = radio_url(current)
+        if not candidate:
+            continue
+        actual = mp3_length(candidate, cache)
+        declared = enc.get("length", "")
+        if actual and (not declared.isdigit() or actual == int(declared)):
+            enc.set("url", candidate)
+            enc.set("length", str(actual))
+            migrated.append(_item_label(item))
+        else:
+            # A missing or mismatched archive copy must be retried next run.
+            cache.pop(candidate, None)
+            if actual:
+                print(f"WARNING: archive length mismatch for {_item_label(item)}: "
+                      f"feed={declared or '?'} archive={actual}")
+    return migrated
+
+
+def _item_label(item):
+    n = ep_num(item)
+    return f"e{n}" if n >= 0 else (item.findtext("title") or "?").strip()
+
+
 def main():
     if not FEED.exists():
         print("feed.xml missing -- run the one-shot builder first", file=sys.stderr)
@@ -181,6 +253,7 @@ def main():
     tree = ET.parse(FEED)
     channel = tree.getroot().find("channel")
     have = {guid_of(it) for it in channel.findall("item")}
+    cache = json.loads(CACHE.read_text()) if CACHE.exists() else {}
     print(f"feed.xml: {len(have)} existing items")
 
     # Retire the FeedBurner hop: advertise the canonical GitHub Pages URL so Apple
@@ -224,27 +297,29 @@ def main():
     if not new:
         bd_changed = refresh_build_date(channel)
         filled = backfill_blank_notes(channel)
-        if nf_added or bd_changed or filled:
+        migrated = migrate_ready_enclosures(channel, cache)
+        if nf_added or bd_changed or filled or migrated:
             tree.write(FEED, encoding="UTF-8", xml_declaration=True)
             ET.parse(FEED)  # validate; raises on malformed
+            if migrated:
+                CACHE.write_text(json.dumps(cache))
             reasons = [r for r, on in (("itunes:new-feed-url", nf_added),
                                        ("lastBuildDate", bd_changed)) if on]
             if filled:
                 reasons.append("backfilled notes: " + ", ".join(f"e{n}" for n in filled))
+            if migrated:
+                reasons.append("migrated audio: " + ", ".join(migrated))
             print(f"feed.xml updated ({'; '.join(reasons)}); no new episodes")
             return 0
         print("no new episodes -- feed.xml unchanged")
         return 0
 
-    cache = json.loads(CACHE.read_text()) if CACHE.exists() else {}
     for it in new:
         enc = it.find("enclosure")
         if enc is not None and enc.get("url"):
             ln = mp3_length(enc.get("url"), cache)
             if ln:
                 enc.set("length", str(ln))
-    CACHE.write_text(json.dumps(cache))
-
     # Insert new items, then re-sort the whole channel newest-first by episode number.
     for it in new:
         channel.append(it)
@@ -255,6 +330,8 @@ def main():
     for it in items:
         channel.append(it)
 
+    migrated = migrate_ready_enclosures(channel, cache)
+    CACHE.write_text(json.dumps(cache))
     refresh_build_date(channel)
     filled = backfill_blank_notes(channel)
     tree.write(FEED, encoding="UTF-8", xml_declaration=True)
@@ -263,6 +340,8 @@ def main():
     print(f"added {len(new)} episode(s): {titles}")
     if filled:
         print("backfilled notes: " + ", ".join(f"e{n}" for n in filled))
+    if migrated:
+        print("migrated audio: " + ", ".join(migrated))
     print(f"feed.xml now {len(items)} items, validated OK")
     return 0
 

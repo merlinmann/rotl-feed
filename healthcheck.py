@@ -15,6 +15,9 @@ Checks:
     non-empty show notes (<description>). This catches the exact bug where e628/e629 shipped
     with blank notes -- a silent failure the count/title checks miss. FeedBurner is a cached
     proxy and lags, so notes are checked on Pages + local only.
+  * Media: the newest 5 episodes plus the three tail items (episode zero and both
+    bonuses) must use the public radio archive and serve byte-range audio whose total
+    size matches the enclosure length. This rejects an HTML outage page posing as a 206.
   * Updater-fired heartbeat (Actions only): query the GitHub API for the most recent
     successful run of update.yml; fail if it's older than 3h (the updater polls every 15 min,
     so 3h == ~12 missed runs == a real stall). Skipped silently when run locally (no token).
@@ -24,8 +27,10 @@ that, plus any count regression, non-200, blank notes, or a stalled updater.
 """
 import json
 import os
+import re
 import sys
 import urllib.request
+import urllib.parse
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
 
@@ -35,6 +40,9 @@ LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feed.xml")
 
 NOTES_CHECK_N = 5            # check the newest N items for present notes
 HEARTBEAT_MAX_AGE_H = 3      # updater polls every 15 min; 3h == ~12 missed runs
+MEDIA_NEWEST_N = 5
+MEDIA_TAIL_N = 3
+RADIO_HOST = "radio.contiguous.me"
 
 
 def fetch(url):
@@ -53,7 +61,6 @@ def count_and_newest(data):
 def _item_label(item):
     """Short label for reporting, e.g. 'e629' or a trimmed title."""
     title = (item.findtext("title") or "").strip()
-    import re
     m = re.search(r"Ep\.?\s*(\d+)", title)
     if m:
         return f"e{m.group(1)}"
@@ -63,7 +70,6 @@ def _item_label(item):
 def _notes_text(item):
     """Description text with tags + whitespace stripped."""
     raw = item.findtext("description") or ""
-    import re
     no_tags = re.sub(r"<[^>]+>", "", raw)
     return no_tags.strip()
 
@@ -73,6 +79,85 @@ def blank_notes(data):
     root = ET.fromstring(data)
     items = root.findall(".//item")[:NOTES_CHECK_N]
     return [_item_label(it) for it in items if not _notes_text(it)]
+
+
+def media_samples(data):
+    """Return newest episodes plus episode zero and bonuses, without duplicates."""
+    root = ET.fromstring(data)
+    items = root.findall(".//item")
+    chosen = items[:MEDIA_NEWEST_N] + items[-MEDIA_TAIL_N:]
+    seen = set()
+    result = []
+    for item in chosen:
+        guid = (item.findtext("guid") or _item_label(item)).strip()
+        if guid not in seen:
+            seen.add(guid)
+            result.append(item)
+    return result
+
+
+def check_media(data, fails):
+    """Verify representative enclosures are real, exact byte-range audio."""
+    for item in media_samples(data):
+        label = _item_label(item)
+        enc = item.find("enclosure")
+        if enc is None or not enc.get("url"):
+            fails.append(f"media[{label}]: missing enclosure")
+            continue
+        url = enc.get("url")
+        if urllib.parse.urlsplit(url).hostname != RADIO_HOST:
+            fails.append(f"media[{label}]: not on {RADIO_HOST}")
+            continue
+        declared = enc.get("length", "")
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "rotl-feed-health/1.0", "Range": "bytes=0-0"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as response:
+                code = response.getcode()
+                content_type = (
+                    response.headers.get("Content-Type") or ""
+                ).split(";", 1)[0].lower()
+                content_range = response.headers.get("Content-Range") or ""
+        except Exception as exc:
+            fails.append(f"media[{label}]: fetch error: {exc}")
+            continue
+        match = re.fullmatch(r"bytes 0-0/(\d+)", content_range)
+        actual = int(match.group(1)) if match else None
+        problems = []
+        if code != 206:
+            problems.append(f"HTTP {code}, expected 206")
+        if not content_type.startswith("audio/"):
+            problems.append(f"Content-Type {content_type or '?'}")
+        if actual is None:
+            problems.append(f"bad Content-Range {content_range or '?'}")
+        elif not declared.isdigit() or actual != int(declared):
+            problems.append(f"size {actual}, feed says {declared or '?'}")
+        if problems:
+            fails.append(f"media[{label}]: " + "; ".join(problems))
+            print(f"media[{label}]: " + "; ".join(problems) + " [BAD]")
+        else:
+            print(f"media[{label}]: 206 {content_type}, {actual} bytes [ok]")
+
+
+def check_pages_enclosures(local_data, pages_data, fails):
+    """Require Pages to expose the same sampled enclosures as the committed feed."""
+    def manifest(data):
+        result = {}
+        for item in media_samples(data):
+            guid = (item.findtext("guid") or _item_label(item)).strip()
+            enc = item.find("enclosure")
+            result[guid] = None if enc is None else (enc.get("url"), enc.get("length"))
+        return result
+
+    local = manifest(local_data)
+    pages = manifest(pages_data)
+    if local != pages:
+        fails.append("media[Pages]: enclosure URLs/lengths do not match committed feed")
+        print("media[Pages]: enclosure URLs/lengths do not match committed feed [STALE]")
+    else:
+        print("media[Pages]: sampled enclosures match committed feed [ok]")
 
 
 def check_updater_heartbeat(fails):
@@ -184,6 +269,18 @@ def main():
             print(f"notes[{src_name}]: BLANK on {', '.join(blanks)} [BLANK]")
         else:
             print(f"notes[{src_name}]: newest {NOTES_CHECK_N} all present [ok]")
+
+    # Representative media checks against the committed source of truth. Pages serves
+    # this file verbatim; checking its enclosure targets catches host/content failures.
+    try:
+        check_media(local_bytes, fails)
+    except ET.ParseError as e:
+        fails.append(f"media[local]: INVALID XML ({e})")
+    if "Pages" in page_data:
+        try:
+            check_pages_enclosures(local_bytes, page_data["Pages"], fails)
+        except ET.ParseError as e:
+            fails.append(f"media[Pages]: INVALID XML ({e})")
 
     # Updater-fired heartbeat (Actions only; silent skip locally).
     check_updater_heartbeat(fails)
