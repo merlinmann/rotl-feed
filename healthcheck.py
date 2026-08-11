@@ -16,11 +16,12 @@ Checks:
     with blank notes -- a silent failure the count/title checks miss. FeedBurner is a cached
     proxy and lags, so notes are checked on Pages + local only.
   * Media: the newest 5 episodes plus the three tail items (episode zero and both
-    bonuses) must use the public radio archive and serve byte-range audio whose total
-    size matches the enclosure length. Pages must match the full committed enclosure
-    catalog; FeedBurner must match after its documented 90-minute polling window.
-    This rejects an HTML outage page posing as a 206 and a title-current proxy with
-    stale audio URLs.
+    bonuses) must serve byte-range audio whose total size matches the enclosure
+    length. A playable episode published within the last 96 hours may await its
+    automatic public-archive copy; older off-archive media fails. Pages must match the
+    full committed enclosure catalog;
+    FeedBurner must match after its documented 90-minute polling window. This rejects
+    an HTML outage page posing as a 206 and a title-current proxy with stale audio URLs.
   * Updater-fired heartbeat (Actions only): query the GitHub API for the most recent
     successful run of update.yml; fail if it's older than 3h (the updater polls every 15 min,
     so 3h == ~12 missed runs == a real stall). Skipped silently when run locally (no token).
@@ -36,6 +37,7 @@ import sys
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from xml.etree import ElementTree as ET
 
 FB = "https://feeds.feedburner.com/RoderickOnTheLine"
@@ -47,6 +49,7 @@ HEARTBEAT_MAX_AGE_H = 3      # updater polls every 15 min; 3h == ~12 missed runs
 MEDIA_NEWEST_N = 5
 MEDIA_TAIL_N = 3
 RADIO_HOST = "radio.contiguous.me"
+ARCHIVE_GRACE_H = 96
 FEEDBURNER_GRACE_MIN = 90
 
 
@@ -101,7 +104,19 @@ def media_samples(data):
     return result
 
 
-def check_media(data, fails):
+def _published_age_hours(item, now=None):
+    """Return an item's age in hours, or None when pubDate is missing/invalid."""
+    try:
+        published = parsedate_to_datetime(item.findtext("pubDate") or "")
+    except (TypeError, ValueError):
+        return None
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return (now - published).total_seconds() / 3600
+
+
+def check_media(data, fails, now=None):
     """Verify representative enclosures are real, exact byte-range audio."""
     for item in media_samples(data):
         label = _item_label(item)
@@ -110,9 +125,13 @@ def check_media(data, fails):
             fails.append(f"media[{label}]: missing enclosure")
             continue
         url = enc.get("url")
-        if urllib.parse.urlsplit(url).hostname != RADIO_HOST:
-            fails.append(f"media[{label}]: not on {RADIO_HOST}")
-            continue
+        off_archive = urllib.parse.urlsplit(url).hostname != RADIO_HOST
+        age_h = _published_age_hours(item, now=now) if off_archive else None
+        archive_pending = (
+            off_archive
+            and age_h is not None
+            and 0 <= age_h < ARCHIVE_GRACE_H
+        )
         declared = enc.get("length", "")
         try:
             req = urllib.request.Request(
@@ -131,6 +150,8 @@ def check_media(data, fails):
         match = re.fullmatch(r"bytes 0-0/(\d+)", content_range)
         actual = int(match.group(1)) if match else None
         problems = []
+        if off_archive and not archive_pending:
+            problems.append(f"not on {RADIO_HOST} after archive grace")
         if code != 206:
             problems.append(f"HTTP {code}, expected 206")
         if not content_type.startswith("audio/"):
@@ -143,7 +164,12 @@ def check_media(data, fails):
             fails.append(f"media[{label}]: " + "; ".join(problems))
             print(f"media[{label}]: " + "; ".join(problems) + " [BAD]")
         else:
-            print(f"media[{label}]: 206 {content_type}, {actual} bytes [ok]")
+            status = (
+                f"ok; archive pending {age_h:.0f}h/{ARCHIVE_GRACE_H}h"
+                if archive_pending
+                else "ok"
+            )
+            print(f"media[{label}]: 206 {content_type}, {actual} bytes [{status}]")
 
 
 def enclosure_manifest(data):

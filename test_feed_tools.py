@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from email.message import Message
 from unittest import mock
 from xml.etree import ElementTree as ET
@@ -95,6 +96,64 @@ class FeedToolsTests(unittest.TestCase):
         failures = []
         healthcheck.check_media(data, failures)
         self.assertTrue(any("Content-Type text/html" in failure for failure in failures))
+
+    @mock.patch("healthcheck.urllib.request.urlopen")
+    def test_healthcheck_allows_playable_enclosure_awaiting_archive(self, urlopen):
+        urlopen.return_value = FakeResponse(
+            "audio/mpeg", "bytes 0-0/59684053"
+        )
+        data = (
+            "<rss><channel><item><title>Ep. 636</title><guid>new</guid>"
+            "<pubDate>Tue, 11 Aug 2026 03:26:55 +0000</pubDate>"
+            '<enclosure url="https://www.merlinmann.com/storage/rotl/rotl_0636.mp3" '
+            'length="59684053" /></item></channel></rss>'
+        ).encode()
+        failures = []
+        healthcheck.check_media(
+            data,
+            failures,
+            now=datetime(2026, 8, 11, 16, tzinfo=timezone.utc),
+        )
+        self.assertEqual(failures, [])
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.headers["Range"], "bytes=0-0")
+
+    @mock.patch("healthcheck.urllib.request.urlopen")
+    def test_healthcheck_rejects_broken_enclosure_during_archive_grace(self, urlopen):
+        urlopen.return_value = FakeResponse("text/html", "bytes 0-0/7745")
+        data = (
+            "<rss><channel><item><title>Ep. 636</title><guid>new</guid>"
+            "<pubDate>Tue, 11 Aug 2026 03:26:55 +0000</pubDate>"
+            '<enclosure url="https://www.merlinmann.com/storage/rotl/rotl_0636.mp3" '
+            'length="7745" /></item></channel></rss>'
+        ).encode()
+        failures = []
+        healthcheck.check_media(
+            data,
+            failures,
+            now=datetime(2026, 8, 11, 16, tzinfo=timezone.utc),
+        )
+        self.assertTrue(any("Content-Type text/html" in failure for failure in failures))
+
+    @mock.patch("healthcheck.urllib.request.urlopen")
+    def test_healthcheck_rejects_old_playable_enclosure_off_archive(self, urlopen):
+        urlopen.return_value = FakeResponse("audio/mpeg", "bytes 0-0/123")
+        data = (
+            "<rss><channel><item><title>Ep. 1</title><guid>old</guid>"
+            "<pubDate>Wed, 22 Jun 2011 00:00:00 +0000</pubDate>"
+            '<enclosure url="https://www.merlinmann.com/storage/rotl/rotl_0001.mp3" '
+            'length="123" /></item></channel></rss>'
+        ).encode()
+        failures = []
+        healthcheck.check_media(
+            data,
+            failures,
+            now=datetime(2026, 8, 11, 16, tzinfo=timezone.utc),
+        )
+        self.assertTrue(
+            any("not on radio.contiguous.me after archive grace" in failure
+                for failure in failures)
+        )
 
     def test_feedburner_same_title_with_stale_enclosure_fails_after_grace(self):
         local = (
