@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Health check for the Roderick on the Line feed.
 
-Run by .github/workflows/health.yml every 6 hours. Exits NON-ZERO when the live feed
+Run by .github/workflows/health.yml every hour. Exits NON-ZERO when the live feed
 looks unhealthy -- a failed scheduled Actions run makes GitHub email the repo owner, so
 a break is caught automatically without any local machine involved.
 
@@ -17,7 +17,10 @@ Checks:
     proxy and lags, so notes are checked on Pages + local only.
   * Media: the newest 5 episodes plus the three tail items (episode zero and both
     bonuses) must use the public radio archive and serve byte-range audio whose total
-    size matches the enclosure length. This rejects an HTML outage page posing as a 206.
+    size matches the enclosure length. Pages must match the full committed enclosure
+    catalog; FeedBurner must match after its documented 90-minute polling window.
+    This rejects an HTML outage page posing as a 206 and a title-current proxy with
+    stale audio URLs.
   * Updater-fired heartbeat (Actions only): query the GitHub API for the most recent
     successful run of update.yml; fail if it's older than 3h (the updater polls every 15 min,
     so 3h == ~12 missed runs == a real stall). Skipped silently when run locally (no token).
@@ -28,6 +31,7 @@ that, plus any count regression, non-200, blank notes, or a stalled updater.
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.request
 import urllib.parse
@@ -43,6 +47,7 @@ HEARTBEAT_MAX_AGE_H = 3      # updater polls every 15 min; 3h == ~12 missed runs
 MEDIA_NEWEST_N = 5
 MEDIA_TAIL_N = 3
 RADIO_HOST = "radio.contiguous.me"
+FEEDBURNER_GRACE_MIN = 90
 
 
 def fetch(url):
@@ -141,23 +146,63 @@ def check_media(data, fails):
             print(f"media[{label}]: 206 {content_type}, {actual} bytes [ok]")
 
 
-def check_pages_enclosures(local_data, pages_data, fails):
-    """Require Pages to expose the same sampled enclosures as the committed feed."""
-    def manifest(data):
-        result = {}
-        for item in media_samples(data):
-            guid = (item.findtext("guid") or _item_label(item)).strip()
-            enc = item.find("enclosure")
-            result[guid] = None if enc is None else (enc.get("url"), enc.get("length"))
-        return result
+def enclosure_manifest(data):
+    """Return the ordered subscriber-facing identity and enclosure catalog."""
+    root = ET.fromstring(data)
+    result = []
+    for item in root.findall(".//item"):
+        enc = item.find("enclosure")
+        result.append(
+            (
+                (item.findtext("guid") or "").strip(),
+                (item.findtext("title") or "").strip(),
+                None if enc is None else enc.get("url"),
+                None if enc is None else enc.get("length"),
+            )
+        )
+    return result
 
-    local = manifest(local_data)
-    pages = manifest(pages_data)
+
+def check_pages_enclosures(local_data, pages_data, fails):
+    """Require Pages to expose the committed enclosure catalog."""
+    local = enclosure_manifest(local_data)
+    pages = enclosure_manifest(pages_data)
     if local != pages:
         fails.append("media[Pages]: enclosure URLs/lengths do not match committed feed")
         print("media[Pages]: enclosure URLs/lengths do not match committed feed [STALE]")
     else:
-        print("media[Pages]: sampled enclosures match committed feed [ok]")
+        print("media[Pages]: enclosure catalog matches committed feed [ok]")
+
+
+def commit_age_minutes():
+    """Return checkout HEAD age so FeedBurner's documented poll lag gets a grace period."""
+    try:
+        timestamp = int(
+            subprocess.check_output(
+                ["git", "show", "-s", "--format=%ct", "HEAD"],
+                text=True,
+                timeout=10,
+            ).strip()
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return (datetime.now(timezone.utc).timestamp() - timestamp) / 60
+
+
+def check_feedburner_enclosures(local_data, feedburner_data, fails, age_min=None):
+    """Fail a stale FeedBurner enclosure catalog after its normal polling window."""
+    if enclosure_manifest(local_data) == enclosure_manifest(feedburner_data):
+        print("media[FeedBurner]: enclosure catalog matches committed feed [ok]")
+        return
+    age_min = commit_age_minutes() if age_min is None else age_min
+    if age_min is not None and age_min < FEEDBURNER_GRACE_MIN:
+        print(
+            f"media[FeedBurner]: waiting for cache refresh "
+            f"({age_min:.0f}m/{FEEDBURNER_GRACE_MIN}m) [LAG]"
+        )
+        return
+    fails.append("media[FeedBurner]: enclosure catalog is stale")
+    print("media[FeedBurner]: enclosure catalog is stale [STALE]")
 
 
 def check_updater_heartbeat(fails):
@@ -281,6 +326,11 @@ def main():
             check_pages_enclosures(local_bytes, page_data["Pages"], fails)
         except ET.ParseError as e:
             fails.append(f"media[Pages]: INVALID XML ({e})")
+    if "FeedBurner" in page_data:
+        try:
+            check_feedburner_enclosures(local_bytes, page_data["FeedBurner"], fails)
+        except ET.ParseError as e:
+            fails.append(f"media[FeedBurner]: INVALID XML ({e})")
 
     # Updater-fired heartbeat (Actions only; silent skip locally).
     check_updater_heartbeat(fails)

@@ -96,6 +96,28 @@ class FeedToolsTests(unittest.TestCase):
         healthcheck.check_media(data, failures)
         self.assertTrue(any("Content-Type text/html" in failure for failure in failures))
 
+    def test_feedburner_same_title_with_stale_enclosure_fails_after_grace(self):
+        local = (
+            "<rss><channel><item><title>Ep. 635</title><guid>same</guid>"
+            '<enclosure url="https://radio.example/rotl_0635.mp3" length="100" />'
+            "</item></channel></rss>"
+        ).encode()
+        stale = local.replace(b"radio.example", b"squarespace.example")
+        failures = []
+        healthcheck.check_feedburner_enclosures(local, stale, failures, age_min=91)
+        self.assertEqual(failures, ["media[FeedBurner]: enclosure catalog is stale"])
+
+    def test_feedburner_stale_enclosure_gets_polling_grace(self):
+        local = (
+            "<rss><channel><item><title>Ep. 635</title><guid>same</guid>"
+            '<enclosure url="https://radio.example/rotl_0635.mp3" length="100" />'
+            "</item></channel></rss>"
+        ).encode()
+        stale = local.replace(b"radio.example", b"squarespace.example")
+        failures = []
+        healthcheck.check_feedburner_enclosures(local, stale, failures, age_min=30)
+        self.assertEqual(failures, [])
+
 
 if __name__ == "__main__":
     unittest.main()
