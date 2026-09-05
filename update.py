@@ -26,6 +26,9 @@ FEED = HERE / "feed.xml"
 CACHE = HERE / ".mp3-length-cache.json"
 LIVE_URL = "http://www.merlinmann.com/roderick/rss.xml"
 RADIO_BASE = "https://radio.contiguous.me/rotl/episodes/"
+SQUARESPACE_FALLBACK_EPISODES = {
+    77, 80, 88, 89, 143, 144, 145, 146, 147, 148, 152,
+}
 
 NS = {
     "content": "http://purl.org/rss/1.0/modules/content/",
@@ -216,6 +219,8 @@ def migrate_ready_enclosures(channel, cache):
     """
     migrated = []
     for item in channel.findall("item"):
+        if ep_num(item) in SQUARESPACE_FALLBACK_EPISODES:
+            continue
         enc = item.find("enclosure")
         if enc is None:
             continue

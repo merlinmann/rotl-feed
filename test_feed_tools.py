@@ -85,6 +85,21 @@ class FeedToolsTests(unittest.TestCase):
             "https://example.test/rotl_0001.mp3",
         )
 
+    @mock.patch("update.mp3_length")
+    def test_migration_preserves_squarespace_fallback(self, length):
+        channel = ET.fromstring(
+            "<channel><item><title>Ep. 152</title>"
+            '<enclosure url="https://dts.podtrac.com/redirect.mp3/'
+            'www.merlinmann.com/storage/rotl/rotl_0152.mp3" length="43778779" />'
+            "</item></channel>"
+        )
+        self.assertEqual(update.migrate_ready_enclosures(channel, {}), [])
+        length.assert_not_called()
+        self.assertIn(
+            "dts.podtrac.com",
+            channel.find("item/enclosure").get("url"),
+        )
+
     @mock.patch("healthcheck.urllib.request.urlopen")
     def test_healthcheck_rejects_html_partial_response(self, urlopen):
         urlopen.return_value = FakeResponse("text/html", "bytes 0-0/7745")
