@@ -23,4 +23,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Check live feed health
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 healthcheck.py

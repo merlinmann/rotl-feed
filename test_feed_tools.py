@@ -26,6 +26,33 @@ class FakeResponse:
 
 
 class FeedToolsTests(unittest.TestCase):
+    @mock.patch.dict("os.environ", {"GITHUB_ACTIONS": "true"}, clear=True)
+    def test_actions_missing_token_fails_heartbeat(self):
+        fails = []
+        healthcheck.check_updater_heartbeat(fails)
+        self.assertTrue(fails)
+
+    @mock.patch.dict("os.environ", {}, clear=True)
+    def test_local_heartbeat_needs_no_token(self):
+        fails = []
+        healthcheck.check_updater_heartbeat(fails)
+        self.assertEqual(fails, [])
+
+    @mock.patch.dict("os.environ", {"GITHUB_TOKEN": "test", "GITHUB_REPOSITORY": "test/feed"}, clear=True)
+    @mock.patch("healthcheck.urllib.request.urlopen")
+    def test_heartbeat_failed_runs_and_fresh_success(self, urlopen):
+        import json
+        response = urlopen.return_value.__enter__.return_value
+        for runs, should_fail in [
+            ([{"conclusion": "failure"}] * 10, True),
+            ([{"conclusion": "success", "updated_at": "2020-01-01T00:00:00Z"}], True),
+            ([{"conclusion": "success", "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}], False),
+        ]:
+            response.read.return_value = json.dumps({"workflow_runs": runs}).encode()
+            fails = []
+            healthcheck.check_updater_heartbeat(fails)
+            self.assertEqual(bool(fails), should_fail)
+
     def test_archive_filename_normalizes_episode_zero(self):
         self.assertEqual(
             update.archive_filename(

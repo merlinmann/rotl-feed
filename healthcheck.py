@@ -241,7 +241,9 @@ def check_updater_heartbeat(fails):
     token = os.environ.get("GITHUB_TOKEN")
     repo = os.environ.get("GITHUB_REPOSITORY")
     if not token or not repo:
-        return  # local run -> skip silently
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            fails.append("updater: heartbeat unavailable (missing Actions token or repository)")
+        return  # local runs do not require Actions credentials
 
     url = (
         f"https://api.github.com/repos/{repo}/actions/workflows/"
@@ -265,7 +267,7 @@ def check_updater_heartbeat(fails):
     runs = payload.get("workflow_runs", [])
     success = [run for run in runs if run.get("conclusion") == "success"]
     if not success:
-        print("updater: heartbeat check skipped (no recent successful update.yml run found)")
+        fails.append("updater: no successful update.yml run among the last 10 runs")
         return
 
     # Newest successful run by updated_at.
