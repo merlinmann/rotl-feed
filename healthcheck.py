@@ -23,8 +23,9 @@ Checks:
     FeedBurner must match after its documented 90-minute polling window. This rejects
     an HTML outage page posing as a 206 and a title-current proxy with stale audio URLs.
   * Updater-fired heartbeat (Actions only): query the GitHub API for the most recent
-    successful run of update.yml; fail if it's older than 3h (the updater polls every 15 min,
-    so 3h == ~12 missed runs == a real stall). Skipped silently when run locally (no token).
+    successful main-branch run of update.yml. After 3h, the health workflow requests
+    one refresh and waits up to 5 minutes for a new success before failing. Scheduled
+    runs can arrive hours late. Local checks never request a refresh.
 
 The original outage was exactly "FeedBurner serving truncated, invalid XML" -- this catches
 that, plus any count regression, non-200, blank notes, or a stalled updater.
@@ -34,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
@@ -45,7 +47,9 @@ PAGES = "https://merlinmann.github.io/rotl-feed/feed.xml"
 LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feed.xml")
 
 NOTES_CHECK_N = 5            # check the newest N items for present notes
-HEARTBEAT_MAX_AGE_H = 3      # updater polls every 15 min; 3h == ~12 missed runs
+HEARTBEAT_MAX_AGE_H = 3      # request recovery after this long without an update
+RECOVERY_TIMEOUT_S = 300
+RECOVERY_POLL_S = 10
 MEDIA_NEWEST_N = 5
 MEDIA_TAIL_N = 3
 RADIO_HOST = "radio.contiguous.me"
@@ -231,59 +235,112 @@ def check_feedburner_enclosures(local_data, feedburner_data, fails, age_min=None
     print("media[FeedBurner]: enclosure catalog is stale [STALE]")
 
 
-def check_updater_heartbeat(fails):
-    """Updater-fired heartbeat -- Actions only.
+def actions_api(token, repo, path, payload=None):
+    """Read Actions state or request one workflow dispatch."""
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/actions/{path}",
+        data=None if payload is None else json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "rotl-feed-health/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        body = response.read()
+    return json.loads(body) if body else {}
 
-    Confirms update.yml is actually running. Skips silently when run locally (no token),
-    so local runs never fail on this. On any GitHub API hiccup it warns but does NOT fail
-    -- a token/API blip must not become a false alarm.
-    """
+
+def updater_runs(token, repo):
+    return actions_api(
+        token, repo, "workflows/update.yml/runs?branch=main&per_page=10"
+    ).get("workflow_runs", [])
+
+
+def recover_updater(token, repo, runs):
+    """Request one refresh and require a new successful completion within five minutes."""
+    # A successful run already observed cannot prove this recovery worked.
+    previous_successes = {
+        run["id"] for run in runs if run.get("conclusion") == "success"
+    }
+    # An existing queued/running update can satisfy recovery without another dispatch.
+    active = any(run.get("status") in {"queued", "in_progress", "waiting", "pending"}
+                 for run in runs)
+    if active:
+        print("updater: waiting for the update already in progress", flush=True)
+    else:
+        actions_api(token, repo, "workflows/update.yml/dispatches", {"ref": "main"})
+        print("updater: requested a refresh to verify the updater", flush=True)
+    deadline = time.monotonic() + RECOVERY_TIMEOUT_S
+    last_runs = runs
+    while time.monotonic() < deadline:
+        last_runs = updater_runs(token, repo)
+        for run in last_runs:
+            if run.get("conclusion") == "success" and run["id"] not in previous_successes:
+                # Also reject older successes entering the response as other runs disappear.
+                completed = datetime.strptime(run["updated_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=timezone.utc
+                )
+                if 0 <= (datetime.now(timezone.utc) - completed).total_seconds() < RECOVERY_TIMEOUT_S:
+                    print(f"updater: refresh succeeded ({run['id']}) [recovered]", flush=True)
+                    return True
+        time.sleep(min(RECOVERY_POLL_S, max(0, deadline - time.monotonic())))
+    state = (last_runs[0].get("conclusion") or last_runs[0].get("status")) if last_runs else "no runs"
+    print(f"updater: no successful refresh within {RECOVERY_TIMEOUT_S}s ({state})", flush=True)
+    return False
+
+
+def check_updater_heartbeat(fails):
+    """Check freshness; the production health workflow may recover a delayed updater."""
     token = os.environ.get("GITHUB_TOKEN")
     repo = os.environ.get("GITHUB_REPOSITORY")
     if not token or not repo:
         if os.environ.get("GITHUB_ACTIONS") == "true":
             fails.append("updater: heartbeat unavailable (missing Actions token or repository)")
-        return  # local runs do not require Actions credentials
+        return
 
-    url = (
-        f"https://api.github.com/repos/{repo}/actions/workflows/"
-        f"update.yml/runs?per_page=10"
+    may_recover = (
+        os.environ.get("ROTL_RECOVER_UPDATER") == "true"
+        and os.environ.get("GITHUB_ACTIONS") == "true"
+        and os.environ.get("GITHUB_REF") == "refs/heads/main"
     )
+    requested_refresh = may_recover and os.environ.get("ROTL_REFRESH_UPDATER") == "true"
+
     try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "rotl-feed-health/1.0",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=30) as r:
-            payload = json.loads(r.read())
-    except Exception as e:
-        print(f"updater: heartbeat check skipped (GitHub API error: {e})")
+        runs = updater_runs(token, repo)
+    except Exception as exc:
+        if requested_refresh:
+            fails.append(f"updater: requested refresh unavailable (GitHub API error: {exc})")
+        else:
+            print(f"updater: heartbeat check skipped (GitHub API error: {exc})")
         return
 
-    runs = payload.get("workflow_runs", [])
     success = [run for run in runs if run.get("conclusion") == "success"]
-    if not success:
-        fails.append("updater: no successful update.yml run among the last 10 runs")
-        return
-
-    # Newest successful run by updated_at.
-    def parse_ts(run):
-        return datetime.strptime(run["updated_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        )
-
-    newest = max(success, key=parse_ts)
-    age = datetime.now(timezone.utc) - parse_ts(newest)
-    age_min = age.total_seconds() / 60
-    if age_min > HEARTBEAT_MAX_AGE_H * 60:
-        fails.append(f"updater: STALE (last success {age_min/60:.1f}h ago)")
-        print(f"updater: STALE (last success {age_min/60:.1f}h ago) [STALE]")
+    if success:
+        newest = max(run["updated_at"] for run in success)
+        completed = datetime.strptime(newest, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        age_h = (datetime.now(timezone.utc) - completed).total_seconds() / 3600
+        if age_h <= HEARTBEAT_MAX_AGE_H and not requested_refresh:
+            print(f"updater: last success {age_h * 60:.0f}m ago [ok]")
+            return
+        problem = f"updater: STALE (last success {age_h:.1f}h ago)"
     else:
-        print(f"updater: last success {age_min:.0f}m ago [ok]")
+        problem = "updater: no successful update.yml run among the last 10 runs"
+
+    if requested_refresh:
+        problem = "updater: requested refresh has not succeeded"
+    if may_recover:
+        try:
+            if recover_updater(token, repo, runs):
+                return
+        except Exception as exc:
+            problem += f"; recovery failed: {exc}"
+        else:
+            problem += "; recovery timed out"
+    fails.append(problem)
+    print(f"{problem} [STALE]")
 
 
 def main():

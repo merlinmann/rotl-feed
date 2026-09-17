@@ -29,3 +29,18 @@ Full background, architecture diagram, and **rollback steps** live in the hub:
 ## Manual refresh
 
 Actions tab → **Update ROTL feed** → **Run workflow**. Or locally: `python3 update.py`.
+
+## Health checks and delayed scheduled runs
+
+The health workflow checks the feed, show notes, and representative audio files.
+GitHub sometimes delivers the scheduled updater runs hours apart, despite the
+15-minute cron. When the last successful main-branch update is over three hours
+old, the health check requests one update and waits up to five minutes for a new
+successful completion. If an update is already queued or running, it waits for
+that run. Failed recovery still fails the health workflow and sends the usual
+GitHub notification. Feed and audio failures remain failures even after recovery.
+
+The health workflow has Actions write permission for this dispatch; its contents
+permission remains read-only. Local checks never dispatch updates. To exercise
+recovery on demand, run **ROTL feed health** with **refresh_updater** enabled.
+The workflow runs the regression tests before checking the live feed.

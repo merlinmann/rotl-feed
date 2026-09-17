@@ -8,21 +8,31 @@ name: ROTL feed health
 on:
   schedule:
     - cron: "37 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      refresh_updater:
+        description: Request and verify an updater run even if the heartbeat is fresh
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-  actions: read   # healthcheck.py reads update.yml run history for the updater heartbeat
+  actions: write  # request a refresh when scheduled updater runs are overdue
 
 jobs:
   health:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - name: Test feed checks
+        run: python3 -m unittest -v
       - name: Check live feed health
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          ROTL_RECOVER_UPDATER: "true"
+          ROTL_REFRESH_UPDATER: ${{ inputs.refresh_updater == true && 'true' || 'false' }}
         run: python3 healthcheck.py
